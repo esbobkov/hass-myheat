@@ -18,7 +18,7 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .api import CLIMATE_ENV_TYPES
+from .api import CLIMATE_ENV_TYPES, ENV_TYPE_COMMON_TEMPERATURE
 from .coordinator import MhConfigEntry, MhDataUpdateCoordinator
 from .entity import MhEnvEntity
 
@@ -42,12 +42,26 @@ async def async_setup_entry(
     """Setup climate platform."""
     coordinator: MhDataUpdateCoordinator = entry.runtime_data
 
-    async_add_entities(
-        [
-            MhEnvClimate(coordinator, entry, env)
-            for env in coordinator.data.get("envs", [])
-            if env.get("type") in CLIMATE_ENV_TYPES
-        ]
+    entities: list[MhEnvClimate] = []
+    for env in coordinator.data.get("envs", []):
+        if env.get("type") in CLIMATE_ENV_TYPES:
+            entities.append(MhEnvClimate(coordinator, entry, env))
+        elif is_controllable_common_env(env):
+            entities.append(MhCommonEnvClimate(coordinator, entry, env))
+
+    async_add_entities(entities)
+
+
+def is_controllable_common_env(env: dict) -> bool:
+    """Return True for a common_temperature env that has a goal.
+
+    Some controllers report every room and floor sensor as common_temperature,
+    including zones that have a goal and are regulated by the controller.
+    Without a climate entity such zones can only be watched, not controlled.
+    A common_temperature env without a goal is a plain sensor and stays one.
+    """
+    return (
+        env.get("type") == ENV_TYPE_COMMON_TEMPERATURE and env.get("target") is not None
     )
 
 
@@ -153,3 +167,32 @@ class MhEnvClimate(MhEnvEntity, ClimateEntity):
         """Get the latest state from the thermostat."""
         self._update_state_attrs()
         self.async_write_ha_state()
+
+
+class MhCommonEnvClimate(MhEnvClimate):
+    """Climate for a common_temperature env that has a goal.
+
+    The API does not tell whether such an env measures air or floor, so the
+    goal range is conservative: 30 °C is already warm for air and is the
+    upper bound usually allowed for a floor covering.
+
+    Preset modes are not offered: MyHeat heating modes are device-wide, and a
+    preset selector on every zone would switch the whole controller. The
+    plain sensor for the same env is still created by the sensor platform.
+    """
+
+    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
+
+    _attr_min_temp = 15
+    _attr_max_temp = 30
+
+    def __init__(
+        self,
+        coordinator: MhDataUpdateCoordinator,
+        config_entry: MhConfigEntry,
+        env: dict,
+    ):
+        super().__init__(coordinator, config_entry, env)
+
+        self._attr_preset_mode = None
+        self._attr_preset_modes = None
