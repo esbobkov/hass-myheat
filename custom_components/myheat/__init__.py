@@ -130,7 +130,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MhConfigEntry):
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.add_update_listener(async_reload_entry)
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     return True
 
 
@@ -140,6 +140,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: MhConfigEntry) -> bool:
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: MhConfigEntry) -> None:
-    """Reload config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
+    """Reload config entry.
+
+    Перезагрузка идёт штатным путём: HA сам снимает запись, снова вызывает
+    настройку и переводит состояние. Прежний вызов `async_setup_entry` напрямую
+    падал с `ConfigEntryError` (запись в состоянии LOADED), и после смены
+    параметров все сущности оставались недоступными.
+    """
+    await hass.config_entries.async_reload(entry.entry_id)

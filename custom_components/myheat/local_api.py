@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from http.cookies import SimpleCookie
 import logging
 import socket
-from typing import Any, Callable
+from collections.abc import Callable
+from http.cookies import SimpleCookie
+from typing import Any
 
 import aiohttp
 import voluptuous as vol
@@ -19,9 +20,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__package__)
 
+# Прошивка контроллера отвечает на /api/login числом (`{"status": 1}`, проверено
+# на живом устройстве), а не логическим значением, поэтому схема принимает и то и другое.
 LOCAL_LOGIN_SCHEMA = vol.Schema(
     {
-        vol.Required("status"): bool,
+        vol.Required("status"): vol.Any(bool, int, str),
     },
     extra=vol.ALLOW_EXTRA,
 )
@@ -122,6 +125,18 @@ class LocalWriteError(LocalApiError):
 
 class LocalVerificationError(LocalWriteError):
     """Local UI API accepted a write but refreshed state did not match."""
+
+
+def _login_status_ok(value: Any) -> bool:
+    """Успешный вход: True, ненулевое число или строка «1»/«true»."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "ok"}
+    return False
 
 
 def _validate_response(
@@ -241,7 +256,7 @@ class LocalApiClient:
                 )
                 status = response.status
                 data = await response.json(content_type=None)
-        except asyncio.TimeoutError, asyncio.CancelledError:
+        except (TimeoutError, asyncio.CancelledError):
             _LOGGER.exception("Timeout calling local API endpoint %s", endpoint)
             raise
         except (aiohttp.ClientError, socket.gaierror) as ex:
@@ -282,7 +297,7 @@ class LocalApiClient:
             auth=False,
         )
         data = _validate_response(LOCAL_LOGIN_SCHEMA, data, "/api/login")
-        if data.get("status") is not True:
+        if not _login_status_ok(data.get("status")):
             raise LocalAuthError("Invalid local MY HEAT credentials")
 
         self._store_session_cookie(headers)
@@ -370,7 +385,7 @@ class LocalApiClient:
         self,
         *,
         obj_id: int,
-        goal: int | float | None,
+        goal: float | None,
         device_id: int | None = None,
         change_mode: bool = False,
     ) -> None:
@@ -443,7 +458,7 @@ class LocalApiClient:
         self,
         *,
         obj_id: int,
-        goal: int | float,
+        goal: float,
         device_id: int | None = None,
         change_mode: bool = False,
     ) -> None:

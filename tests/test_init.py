@@ -50,3 +50,25 @@ async def test_child_devices_linked_via_device_id(hass, bypass_get_device_info, 
         assert child.via_device_id != child.id
 
     assert "deprecated" not in caplog.text
+
+
+async def test_options_update_reloads_entry_and_keeps_entities(
+    hass, bypass_get_device_info
+):
+    """Смена параметров должна перезагружать запись штатно, без ConfigEntryError.
+
+    Раньше обработчик вызывал async_setup_entry напрямую при состоянии LOADED,
+    и после смены параметров интеграция оставалась без данных.
+    """
+    entry = await setup_mock_entry(hass)
+    assert entry.state is ConfigEntryState.LOADED
+    before = len(hass.states.async_all())
+    assert before > 0
+
+    hass.config_entries.async_update_entry(entry, options={"local_mode_enabled": False})
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert isinstance(entry.runtime_data, MhDataUpdateCoordinator)
+    assert len(hass.states.async_all()) == before
+    assert all(s.state != "unavailable" for s in hass.states.async_all("sensor"))

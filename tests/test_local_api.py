@@ -84,6 +84,32 @@ async def test_local_login_stores_cookie_and_sends_it():
     assert session.requests[1]["headers"]["Cookie"] == "EspSessId=session-id"
 
 
+@pytest.mark.parametrize("status", [1, "1", "true"])
+async def test_local_login_accepts_numeric_and_string_status(status):
+    """Живой контроллер отвечает {"status": 1} — не логическим значением."""
+    session = FakeSession(
+        [
+            FakeResponse(
+                {"status": status},
+                headers={"Set-Cookie": "EspSessId=session-id; Max-Age=86400; Path=/;"},
+            ),
+        ]
+    )
+    client = local_client(session)
+
+    await client.async_login()
+    assert client.authenticated
+
+
+@pytest.mark.parametrize("status", [0, "0", False])
+async def test_local_login_rejects_zero_status(status):
+    session = FakeSession([FakeResponse({"status": status})])
+    client = local_client(session)
+
+    with pytest.raises(LocalAuthError):
+        await client.async_login()
+
+
 async def test_local_failed_login_raises_auth_error():
     session = FakeSession([FakeResponse({"status": False})])
     client = local_client(session)
