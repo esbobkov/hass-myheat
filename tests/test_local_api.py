@@ -4,6 +4,7 @@ from copy import deepcopy
 
 import pytest
 
+from custom_components.myheat import local_api
 from custom_components.myheat.const import LOCAL_SENTINEL
 from custom_components.myheat.hybrid_api import normalize_local_device_info
 from custom_components.myheat.local_api import (
@@ -44,11 +45,19 @@ class FakeSession:
     async def post(self, url, *, headers, json):
         self.requests.append(
             {
+                "method": "POST",
                 "url": url,
                 "headers": headers,
                 "json": json,
             }
         )
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def get(self, url, *, headers):
+        self.requests.append({"method": "GET", "url": url, "headers": headers})
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -301,3 +310,114 @@ async def test_local_write_verification_mismatch_raises():
 
     with pytest.raises(LocalVerificationError):
         await client.async_set_heater_enabled(obj_id=45, enabled=False)
+
+
+COOKIE = {"Set-Cookie": "EspSessId=session-id; Max-Age=86400; Path=/;"}
+
+
+@pytest.fixture(autouse=True)
+def _no_async_wait(monkeypatch):
+    monkeypatch.setattr(local_api, "ASYNC_POLL_INTERVAL", 0)
+
+
+async def test_get_obj_state_uses_async_flow_like_the_controller_ui():
+    """По HAR веб-интерфейса: POST .../async -> 202 {id}, затем опрос getAsyncRequest."""
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"id": "6dda6b37"}, status=202),
+            FakeResponse({"ar_status": 0}),
+            FakeResponse(MOCK_LOCAL_OBJ_STATE),
+        ]
+    )
+    client = local_client(session)
+
+    state = await client.async_get_obj_state()
+
+    assert state["heaters"]
+    assert session.requests[1]["method"] == "POST"
+    assert session.requests[1]["url"].endswith("/api/getObjState/async")
+    assert session.requests[1]["headers"]["X-Requested-With"] == "XMLHttpRequest"
+    assert session.requests[2]["method"] == "GET"
+    assert "/api/getAsyncRequest?id=6dda6b37&_=" in session.requests[2]["url"]
+    assert session.requests[3]["headers"]["Cookie"] == "EspSessId=session-id"
+
+
+async def test_get_obj_state_falls_back_to_sync_when_async_path_is_missing():
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({}, status=404),
+            FakeResponse(MOCK_LOCAL_OBJ_STATE),
+        ]
+    )
+    client = local_client(session)
+
+    await client.async_get_obj_state()
+
+    assert session.requests[2]["url"].endswith("/api/getObjState")
+
+
+async def test_async_request_error_status_raises():
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"id": "x"}, status=202),
+            FakeResponse({"ar_status": -1}),
+        ]
+    )
+    client = local_client(session)
+
+    with pytest.raises(LocalResponseError):
+        await client.async_get_obj_state()
+
+
+async def test_login_with_empty_session_cookie_is_an_auth_error():
+    """Контроллер без свободных сессий отвечает status 1, но пустым EspSessId."""
+    session = FakeSession(
+        [
+            FakeResponse(
+                {"status": 1}, headers={"Set-Cookie": "EspSessId=; Max-Age=86400"}
+            )
+        ]
+    )
+    client = local_client(session)
+
+    with pytest.raises(LocalAuthError):
+        await client.async_login()
+    assert not client.authenticated
+
+
+async def test_forbidden_triggers_one_relogin(monkeypatch):
+    monkeypatch.setattr(local_api, "RELOGIN_MIN_INTERVAL", 0)
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"status": -1}, status=403),
+            FakeResponse(
+                {"status": 1},
+                headers={"Set-Cookie": "EspSessId=second; Max-Age=86400; Path=/;"},
+            ),
+            FakeResponse(MOCK_LOCAL_OBJ_STATE),
+        ]
+    )
+    client = local_client(session)
+
+    await client.async_get_obj_state()
+
+    assert session.requests[-1]["headers"]["Cookie"] == "EspSessId=second"
+
+
+async def test_forbidden_relogin_is_rate_limited():
+    """Не входить в цикле: каждый вход занимает слот сессии контроллера."""
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"status": -1}, status=403),
+        ]
+    )
+    client = local_client(session)
+
+    with pytest.raises(LocalResponseError):
+        await client.async_get_obj_state()
+    assert len(session.requests) == 2

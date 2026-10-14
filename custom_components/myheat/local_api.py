@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 from collections.abc import Callable
 from http.cookies import SimpleCookie
 from typing import Any
@@ -19,6 +20,15 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__package__)
+
+# Контроллер отвечает на getObjState асинхронно (так делает и его веб-интерфейс по HAR
+# владельца): POST /api/getObjState/async -> 202 {"id": ...}, затем раз в секунду
+# GET /api/getAsyncRequest?id=...; пока в ответе есть ar_status, результат не готов.
+ASYNC_POLL_INTERVAL = 1.0
+ASYNC_TIMEOUT = 45.0
+# Повторный вход после 403 не чаще этого интервала: сессий у контроллера мало, а каждый
+# вход занимает слот (пустой cookie в ответ на вход — признак, что слоты кончились).
+RELOGIN_MIN_INTERVAL = 30.0
 
 # Прошивка контроллера отвечает на /api/login числом (`{"status": 1}`, проверено
 # на живом устройстве), а не логическим значением, поэтому схема принимает и то и другое.
@@ -215,6 +225,7 @@ class LocalApiClient:
         self._session = session
         self._request_timeout = request_timeout
         self._session_id: str | None = None
+        self._last_login_at: float | None = None
         self._obj_state: dict[str, Any] | None = None
         self._device_state: dict[str, Any] | None = None
 
@@ -231,6 +242,7 @@ class LocalApiClient:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
         }
         if auth and self._session_id:
             headers["Cookie"] = f"EspSessId={self._session_id}"
@@ -243,20 +255,45 @@ class LocalApiClient:
         *,
         auth: bool = True,
     ) -> tuple[dict[str, Any], Any]:
+        return await self._request("POST", endpoint, payload, auth=auth)
+
+    async def _get(self, endpoint: str) -> tuple[dict[str, Any], Any]:
+        return await self._request("GET", endpoint, None)
+
+    def _may_relogin(self) -> bool:
+        return (
+            self._last_login_at is None
+            or time.monotonic() - self._last_login_at >= RELOGIN_MIN_INTERVAL
+        )
+
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        payload: dict[str, Any] | None,
+        *,
+        auth: bool = True,
+        retried: bool = False,
+    ) -> tuple[dict[str, Any], Any]:
         if auth:
             await self._ensure_authenticated()
 
         url = self._url(endpoint)
         try:
             async with asyncio.timeout(self._request_timeout):
-                response = await self._session.post(
-                    url,
-                    headers=self._headers(auth=auth),
-                    json=payload,
-                )
+                if method == "GET":
+                    response = await self._session.get(
+                        url, headers=self._headers(auth=auth)
+                    )
+                else:
+                    response = await self._session.post(
+                        url,
+                        headers=self._headers(auth=auth),
+                        json=payload,
+                    )
                 status = response.status
                 data = await response.json(content_type=None)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError, asyncio.CancelledError:
             _LOGGER.exception("Timeout calling local API endpoint %s", endpoint)
             raise
         except (aiohttp.ClientError, socket.gaierror) as ex:
@@ -266,6 +303,12 @@ class LocalApiClient:
             _LOGGER.exception("Invalid JSON from local API endpoint %s", endpoint)
             raise LocalResponseError(f"Invalid local API JSON: {endpoint}") from ex
 
+        if status == 403 and auth and not retried and self._may_relogin():
+            # Сессия протухла или сброшена контроллером: войти заново один раз.
+            self._session_id = None
+            return await self._request(
+                method, endpoint, payload, auth=auth, retried=True
+            )
         if status < 200 or status >= 300:
             raise LocalResponseError(f"Local API endpoint {endpoint} returned {status}")
         if not isinstance(data, dict):
@@ -275,6 +318,39 @@ class LocalApiClient:
 
         return data, response.headers
 
+    async def _request_async(
+        self, method: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Call an asynchronous controller method and wait for its result."""
+
+        endpoint = f"/api/{method}"
+        try:
+            start, _ = await self._post(f"{endpoint}/async", payload)
+        except LocalResponseError as ex:
+            if "returned 404" not in str(ex):
+                raise
+            # Прошивка без асинхронного пути отвечает на метод сразу.
+            data, _ = await self._post(endpoint, payload)
+            return data
+
+        request_id = start.get("id")
+        if request_id is None:
+            return start
+
+        deadline = time.monotonic() + ASYNC_TIMEOUT
+        while True:
+            await asyncio.sleep(ASYNC_POLL_INTERVAL)
+            data, _ = await self._get(
+                f"/api/getAsyncRequest?id={request_id}&_={int(time.time() * 1000)}"
+            )
+            if "ar_status" not in data:
+                return data
+            ar_status = _clean_int(data.get("ar_status"))
+            if ar_status is None or ar_status < 0:
+                raise LocalResponseError(f"Local API {method} failed: {data}")
+            if time.monotonic() > deadline:
+                raise LocalResponseError(f"Local API {method} timed out")
+
     async def _ensure_authenticated(self) -> None:
         if self._session_id is None:
             await self.async_login()
@@ -283,7 +359,7 @@ class LocalApiClient:
         for value in headers.getall("Set-Cookie", []):
             cookie = SimpleCookie()
             cookie.load(value)
-            if morsel := cookie.get("EspSessId"):
+            if (morsel := cookie.get("EspSessId")) and morsel.value:
                 self._session_id = morsel.value
                 return
 
@@ -291,6 +367,7 @@ class LocalApiClient:
         """Login and store the returned EspSessId cookie."""
 
         self._session_id = None
+        self._last_login_at = time.monotonic()
         data, headers = await self._post(
             "/api/login",
             {"login": self._username, "pswd": self._password},
@@ -302,12 +379,15 @@ class LocalApiClient:
 
         self._store_session_cookie(headers)
         if self._session_id is None:
-            raise LocalAuthError("Local MY HEAT login did not return EspSessId")
+            raise LocalAuthError(
+                "Local MY HEAT login did not return a session id (the controller may "
+                "be out of sessions: wait for them to expire, do not retry in a loop)"
+            )
 
     async def async_get_obj_state(self) -> dict[str, Any]:
         """Fetch raw local object state."""
 
-        data, _ = await self._post("/api/getObjState", {})
+        data = await self._request_async("getObjState", {})
         data = _validate_response(LOCAL_OBJ_STATE_SCHEMA, data, "/api/getObjState")
         self._obj_state = data
         return data
