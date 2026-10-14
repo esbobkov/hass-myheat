@@ -1,5 +1,6 @@
 """Tests for the local MY HEAT UI API client."""
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -28,10 +29,16 @@ class FakeHeaders(dict):
 
 
 class FakeResponse:
-    def __init__(self, payload, *, status=200, headers=None):
+    def __init__(self, payload, *, status=200, headers=None, raw=None):
         self._payload = payload
+        self._raw = raw
         self.status = status
         self.headers = FakeHeaders(headers or {})
+
+    async def read(self):
+        if self._raw is not None:
+            return self._raw
+        return json.dumps(self._payload).encode("utf-8")
 
     async def json(self, *, content_type=None):  # pylint: disable=unused-argument
         return self._payload
@@ -421,3 +428,37 @@ async def test_forbidden_relogin_is_rate_limited():
     with pytest.raises(LocalResponseError):
         await client.async_get_obj_state()
     assert len(session.requests) == 2
+
+
+async def test_obj_state_with_a_cut_cyrillic_letter_is_accepted():
+    """Контроллер режет имена по байтам: тело невалидно как UTF-8 (проба владельца)."""
+    raw = json.dumps(MOCK_LOCAL_OBJ_STATE, ensure_ascii=False).encode("utf-8")
+    # Первый байт кириллической буквы без второго перед обычным символом.
+    raw = raw.replace(b'"n": "', b'"n": "\xd0', 1)
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"id": "x"}, status=202),
+            FakeResponse(None, raw=raw),
+        ]
+    )
+    client = local_client(session)
+
+    result = await client.async_get_obj_state()
+
+    assert result["heaters"]
+
+
+async def test_login_sends_browser_like_headers():
+    session = FakeSession([FakeResponse({"status": 1}, headers=COOKIE)])
+    client = local_client(session)
+
+    await client.async_login()
+
+    headers = session.requests[0]["headers"]
+    assert headers["Origin"] == "http://192.0.2.10"
+    assert headers["Referer"].endswith("/login.html")
+    assert headers["X-Requested-With"] == "XMLHttpRequest"
+    assert "Mozilla" in headers["User-Agent"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 import time
@@ -239,9 +240,16 @@ class LocalApiClient:
         return f"{self._base_url}{endpoint}"
 
     def _headers(self, *, auth: bool) -> dict[str, str]:
+        # Контроллер выдаёт непустой cookie сессии, только если вход похож на запрос
+        # собственной страницы: с заголовками браузера (проверено на устройстве: вход без них
+        # даёт status 1 и пустой EspSessId, с ними — рабочую сессию). Какой именно заголовок
+        # решает, не выяснено, поэтому шлём тот же набор, что и интерфейс.
         headers = {
-            "Accept": "application/json",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/json",
+            "Origin": self._base_url,
+            "Referer": f"{self._base_url}/" if auth else f"{self._base_url}/login.html",
+            "User-Agent": "Mozilla/5.0 (compatible; hass-myheat)",
             "X-Requested-With": "XMLHttpRequest",
         }
         if auth and self._session_id:
@@ -292,7 +300,11 @@ class LocalApiClient:
                         json=payload,
                     )
                 status = response.status
-                data = await response.json(content_type=None)
+                raw = await response.read()
+                # Контроллер режет строки по байтам и может оборвать кириллическую
+                # букву посередине: тело невалидно как UTF-8 (подтверждено на getObjState
+                # пробой владельца), а aiohttp .json() строго декодирует и падает.
+                data = json.loads(raw.decode("utf-8", errors="replace"), strict=False)
         except TimeoutError, asyncio.CancelledError:
             _LOGGER.exception("Timeout calling local API endpoint %s", endpoint)
             raise
