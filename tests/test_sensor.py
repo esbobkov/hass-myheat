@@ -101,7 +101,7 @@ async def test_other_env_types_become_sensors(hass):
     ):
         await setup_mock_entry(hass)
 
-    assert len(hass.states.async_entity_ids(WATER_HEATER_DOMAIN)) == 3
+    assert len(hass.states.async_entity_ids(WATER_HEATER_DOMAIN)) == 2
 
     outdoor = state_by_name(hass, SENSOR_DOMAIN, "test_device Уличная температура")
     assert outdoor.state == "19"

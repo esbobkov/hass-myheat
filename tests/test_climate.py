@@ -10,14 +10,16 @@ from homeassistant.components.climate import (
     ATTR_MIN_TEMP,
     ATTR_PRESET_MODE,
     ATTR_PRESET_MODES,
-    DOMAIN as CLIMATE_DOMAIN,
-    ClimateEntityFeature,
-    HVACAction,
-    HVACMode,
     PRESET_HOME,
     SERVICE_SET_HVAC_MODE,
     SERVICE_SET_PRESET_MODE,
     SERVICE_SET_TEMPERATURE,
+    ClimateEntityFeature,
+    HVACAction,
+    HVACMode,
+)
+from homeassistant.components.climate import (
+    DOMAIN as CLIMATE_DOMAIN,
 )
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import (
@@ -192,4 +194,4 @@ async def test_common_temperature_climate_sets_goal(hass):
                 service_data={ATTR_ENTITY_ID: room.entity_id, ATTR_TEMPERATURE: 24.5},
                 blocking=True,
             )
-            assert goal_func.call_args == call(obj_id=30, goal=24.5)
+            assert goal_func.call_args == call(obj_id=30, goal=24.5, change_mode=True)

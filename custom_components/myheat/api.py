@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import socket
-from typing import Any, Union
+from typing import Any
 
 import aiohttp
 import voluptuous as vol
@@ -34,7 +34,9 @@ WATER_HEATER_ENV_TYPES = {
     ENV_TYPE_BOILER_TEMPERATURE,
     ENV_TYPE_DHW_TEMPERATURE,
     ENV_TYPE_PI_REGULATION_CIRCUIT,
-    ENV_TYPE_COMMON_TEMPERATURE,
+    # Форк: ENV_TYPE_COMMON_TEMPERATURE здесь намеренно нет. В апстриме 0.13.1 такие
+    # зоны стали water_heater, а их датчики температуры пропали; в форке зоны с
+    # уставкой — climate (climate.py), без уставки — обычные датчики (sensor.py).
 }
 TEMPERATURE_ENV_TYPES = {
     ENV_TYPE_ROOM_TEMPERATURE,
@@ -203,7 +205,7 @@ class MhApiClient:
         self,
         *,
         obj_id: int,
-        goal: Union[int, float],
+        goal: float,
         device_id: int | None = None,
         change_mode: bool = False,
     ) -> None:
@@ -237,7 +239,7 @@ class MhApiClient:
         self,
         *,
         obj_id: int,
-        goal: Union[int, float],
+        goal: float,
         device_id: int | None = None,
         change_mode: bool = False,
     ) -> None:
@@ -306,7 +308,7 @@ class MhApiClient:
 
                 return data.get("data", {})
 
-        except (asyncio.TimeoutError, asyncio.CancelledError) as ex:
+        except (TimeoutError, asyncio.CancelledError) as ex:
             _LOGGER.exception(
                 "Timeout error fetching information from %s - %s",
                 url,

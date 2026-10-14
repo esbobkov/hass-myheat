@@ -3,15 +3,18 @@
 from copy import deepcopy
 from unittest.mock import call, patch
 
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.components.water_heater import (
     ATTR_OPERATION_MODE,
-    DOMAIN as WATER_HEATER_DOMAIN,
     SERVICE_SET_OPERATION_MODE,
     SERVICE_SET_TEMPERATURE,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
     STATE_OFF,
     STATE_ON,
+)
+from homeassistant.components.water_heater import (
+    DOMAIN as WATER_HEATER_DOMAIN,
 )
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE
 
@@ -67,8 +70,8 @@ async def test_pi_regulation_circuit_is_water_heater(hass):
     assert circuit.attributes["temperature"] is None
 
 
-async def test_common_temperature_is_water_heater(hass):
-    """Test common_temperature envs are exposed as water heaters."""
+async def test_common_temperature_without_goal_is_sensor_not_water_heater(hass):
+    """Форк: common_temperature без уставки — обычный датчик, а не water_heater."""
     data = deepcopy(MOCK_GET_DEVICE_INFO["data"])
     data["envs"].append(
         {
@@ -89,12 +92,10 @@ async def test_common_temperature_is_water_heater(hass):
     ):
         await setup_mock_entry(hass)
 
-    assert len(hass.states.async_entity_ids(WATER_HEATER_DOMAIN)) == 3
+    assert len(hass.states.async_entity_ids(WATER_HEATER_DOMAIN)) == 2
 
-    common = state_by_name(hass, WATER_HEATER_DOMAIN, "test_device 1ТА Выс-температура")
-    assert common.state == STATE_OFF
-    assert common.attributes["current_temperature"] == 45.2
-    assert common.attributes["temperature"] is None
+    common = state_by_name(hass, SENSOR_DOMAIN, "test_device 1ТА Выс-температура")
+    assert common.state.startswith("45.2")
 
 
 async def test_water_heater_services(hass, bypass_get_device_info):
