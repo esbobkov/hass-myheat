@@ -1,5 +1,6 @@
 """Tests for the local MY HEAT UI API client."""
 
+import asyncio
 import json
 from copy import deepcopy
 
@@ -462,3 +463,49 @@ async def test_login_sends_browser_like_headers():
     assert headers["Referer"].endswith("/login.html")
     assert headers["X-Requested-With"] == "XMLHttpRequest"
     assert "Mozilla" in headers["User-Agent"]
+
+
+async def test_concurrent_obj_state_requests_are_serialized():
+    """Опрос и запись не должны идти на контроллер одновременно (ESP отвечает оборванным JSON)."""
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"id": "a"}, status=202),
+            FakeResponse({"ar_status": 0}),
+            FakeResponse(MOCK_LOCAL_OBJ_STATE),
+            FakeResponse({"id": "b"}, status=202),
+            FakeResponse({"ar_status": 0}),
+            FakeResponse(MOCK_LOCAL_OBJ_STATE),
+        ]
+    )
+    client = local_client(session)
+
+    await asyncio.gather(client.async_get_obj_state(), client.async_get_obj_state())
+
+    urls = [r["url"].split("/api/")[1].split("?")[0] for r in session.requests]
+    assert urls == [
+        "login",
+        "getObjState/async",
+        "getAsyncRequest",
+        "getAsyncRequest",
+        "getObjState/async",
+        "getAsyncRequest",
+        "getAsyncRequest",
+    ]
+
+
+async def test_broken_async_result_is_retried_once():
+    session = FakeSession(
+        [
+            FakeResponse({"status": 1}, headers=COOKIE),
+            FakeResponse({"id": "a"}, status=202),
+            FakeResponse(None, raw=b'{"deviceFlags": 1, "envs": [{"n": "'),
+            FakeResponse({"id": "b"}, status=202),
+            FakeResponse(MOCK_LOCAL_OBJ_STATE),
+        ]
+    )
+    client = local_client(session)
+
+    state = await client.async_get_obj_state()
+
+    assert state["heaters"]

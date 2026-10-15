@@ -227,6 +227,11 @@ class LocalApiClient:
         self._request_timeout = request_timeout
         self._session_id: str | None = None
         self._last_login_at: float | None = None
+        # Контроллер (ESP) обрабатывает один запрос за раз: при пересечении запросов
+        # (опрос раз в 10 с и запись уставки с проверкой чтением) результат getObjState
+        # приходит оборванным («Invalid local API JSON: getAsyncRequest», 15.10.2026 утром
+        # из-за этого не вернулась одна из 13 уставок). Поэтому все операции — по очереди.
+        self._lock = asyncio.Lock()
         self._obj_state: dict[str, Any] | None = None
         self._device_state: dict[str, Any] | None = None
 
@@ -287,6 +292,7 @@ class LocalApiClient:
             await self._ensure_authenticated()
 
         url = self._url(endpoint)
+        raw = b""
         try:
             async with asyncio.timeout(self._request_timeout):
                 if method == "GET":
@@ -312,7 +318,13 @@ class LocalApiClient:
             _LOGGER.exception("Error calling local API endpoint %s: %s", endpoint, ex)
             raise LocalResponseError(f"Local API request failed: {endpoint}") from ex
         except ValueError as ex:
-            _LOGGER.exception("Invalid JSON from local API endpoint %s", endpoint)
+            _LOGGER.warning(
+                "Invalid JSON from local API endpoint %s: %s bytes, starts %r, ends %r",
+                endpoint,
+                len(raw),
+                raw[:60],
+                raw[-60:],
+            )
             raise LocalResponseError(f"Invalid local API JSON: {endpoint}") from ex
 
         if status == 403 and auth and not retried and self._may_relogin():
@@ -399,7 +411,20 @@ class LocalApiClient:
     async def async_get_obj_state(self) -> dict[str, Any]:
         """Fetch raw local object state."""
 
-        data = await self._request_async("getObjState", {})
+        async with self._lock:
+            return await self._get_obj_state_locked()
+
+    async def _get_obj_state_locked(self) -> dict[str, Any]:
+        """getObjState; the caller holds self._lock."""
+
+        try:
+            data = await self._request_async("getObjState", {})
+        except LocalResponseError as ex:
+            if "Invalid local API JSON" not in str(ex):
+                raise
+            # Оборванный результат бывает разово: повторить весь цикл один раз.
+            _LOGGER.debug("Retrying getObjState after a broken result: %s", ex)
+            data = await self._request_async("getObjState", {})
         data = _validate_response(LOCAL_OBJ_STATE_SCHEMA, data, "/api/getObjState")
         self._obj_state = data
         return data
@@ -407,7 +432,8 @@ class LocalApiClient:
     async def async_get_state(self) -> dict[str, Any]:
         """Fetch raw local device diagnostics."""
 
-        data, _ = await self._post("/api/getState", {})
+        async with self._lock:
+            data, _ = await self._post("/api/getState", {})
         data = _validate_response(LOCAL_DEVICE_STATE_SCHEMA, data, "/api/getState")
         self._device_state = data
         return data
@@ -464,12 +490,13 @@ class LocalApiClient:
         payload: dict[str, Any],
         verify: Callable[[dict[str, Any]], bool] | None,
     ) -> None:
-        data, _ = await self._post("/api/setObjState", payload)
-        data = _validate_response(LOCAL_WRITE_SCHEMA, data, "/api/setObjState")
-        if type(data.get("status")) is not int or data.get("status") != 1:
-            raise LocalWriteError("Local API rejected the command")
+        async with self._lock:
+            data, _ = await self._post("/api/setObjState", payload)
+            data = _validate_response(LOCAL_WRITE_SCHEMA, data, "/api/setObjState")
+            if type(data.get("status")) is not int or data.get("status") != 1:
+                raise LocalWriteError("Local API rejected the command")
 
-        obj_state = await self.async_get_obj_state()
+            obj_state = await self._get_obj_state_locked()
         if verify is not None and not verify(obj_state):
             raise LocalVerificationError("Local API state verification failed")
 
